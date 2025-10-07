@@ -1,0 +1,10 @@
+- [x] Connection accept on main thread
+- [x] Spwan worker threads
+- [ ] add file to WAL through worker threads
+- [ ] assign partition to the msg at broker not from client
+- [ ] create partition level workers & wal.log file
+- [ ] create thread pool and thread takes requests for different partition.
+- [ ] add dedicated queue, like if 2 threads uses the same partition then locking will slow down.
+- [ ] Create Producer apis, like ack & batching
+- [ ] create admin client to manage topics, partitions and other stuff.
+- [ ] Consumer Client and checks for apis like how many consumers connected currently and store consumer level metadata. 

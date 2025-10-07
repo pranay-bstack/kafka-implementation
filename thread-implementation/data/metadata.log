@@ -1,0 +1,2 @@
+{"type":"create_topic","createdBy":"::1:64073","timestamp":1759689409296,"name":"hello-world","partitions":1}
+{"type":"create_topic","createdBy":"::1:63333","timestamp":1759691141353,"name":"topic2","partitions":5}

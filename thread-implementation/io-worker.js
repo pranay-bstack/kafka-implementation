@@ -3,7 +3,6 @@ import { parentPort, workerData } from "worker_threads";
 import fs from "fs/promises";
 import { LOG_DIRECTORY } from "./config.js";
 import { ensureDataDir } from "./utils.js";
-import KafkaAdminClient from "./metadata-manager.js";
 import { API_TYPES, KAFKA_CLIENTS } from "./contansts.js";
 
 class IOWorker {
@@ -13,8 +12,6 @@ class IOWorker {
     ensureDataDir(this.walPath);
     this.setupMessageHandler();
     this.workerNumber = workerData.threadId;
-    this.adminClientInstance = null;
-    // this.adminClientInstance = new KafkaAdminClient();
   }
 
   setupMessageHandler() {
@@ -28,15 +25,15 @@ class IOWorker {
     try {
       let response = null;
       switch (request.apiKey) {
-        case API_TYPES.CREATE_TOPIC:
-          response = await this.adminClientInstance.createTopic(request);
-          break;
-        case API_TYPES.EDIT_PARTITIONS:
-          response = await this.adminClientInstance.editTopicPartition(request);
-          break;
-        case API_TYPES.LIST_TOPICS:
-          response = this.adminClientInstance.listTopics();
-          break;
+        // case API_TYPES.CREATE_TOPIC:
+        //   response = await this.adminClientInstance.createTopic(request);
+        //   break;
+        // case API_TYPES.EDIT_PARTITIONS:
+        //   response = await this.adminClientInstance.editTopicPartition(request);
+        //   break;
+        // case API_TYPES.LIST_TOPICS:
+        //   response = this.adminClientInstance.listTopics();
+        //   break;
         case API_TYPES.PRODUCE:
           response = await this.handleProducerRequest(request);
           break;
@@ -62,11 +59,6 @@ class IOWorker {
   }
 
   handleProducerRequest = async (request) => {
-    // Assign partition and offset
-    if (this.adminClientInstance.checkTopicExists(request.topic) === false) {
-      throw new Error(`Topic '${request.topic}' does not exist`);
-    }
-
     // Create WAL entry
     const walEntry = {
       offset: request.offset,

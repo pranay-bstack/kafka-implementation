@@ -2,8 +2,8 @@ import net from "net";
 import { Worker } from "worker_threads";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import KafkaAdminClient from "./metadata-manager.js";
-import { API_TYPES, KAFKA_CLIENTS } from "./contansts.js";
+import MetadataManager from "./metadata-manager.js";
+import { API_TYPES, ADMIN_COMMAND_TYPES } from "./contansts.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -13,16 +13,26 @@ class KafkaBroker {
     this.port = port;
     this.server = null;
     this.requestQueue = [];
-    this.workers = [];
+    this.ioWorkers = [];
+    this.adminWorker = null;
     this.numWorkers = numWorkers;
     this.connections = new Map();
     this.nextWorkerId = 0;
     this.partitionOffsets = new Map();
-    this.adminClientInstance = new KafkaAdminClient();
+    
+    // Metadata manager (main thread cache)
+    this.metadataManager = new MetadataManager();
   }
 
-  start() {
-    this.startWorkers();
+  async start() {
+    // Initialize metadata cache
+    await this.metadataManager.initialize();
+    
+    // Start admin worker (single thread)
+    this.startAdminWorker();
+    
+    // Start IO workers (multiple threads)
+    this.startIOWorkers();
 
     this.server = net.createServer((socket) => {
       this.handleConnection(socket);
@@ -30,39 +40,54 @@ class KafkaBroker {
 
     this.server.listen(this.port, () => {
       console.log(`Kafka Broker listening on port ${this.port}`);
-      console.log(`Workers: ${this.numWorkers}`);
+      console.log(`IO Workers: ${this.numWorkers}`);
+      console.log(`Admin Worker: 1 (dedicated)`);
     });
   }
 
-  startWorkers() {
-    const workerPath = join(__dirname, "io-worker.js");
+  startAdminWorker() {
+    const adminWorkerPath = join(__dirname, "admin-worker.js");
+    this.adminWorker = new Worker(adminWorkerPath);
+
+    this.adminWorker.on("message", (response) => {
+      this.handleAdminWorkerResponse(response);
+    });
+
+    this.adminWorker.on("error", (err) => {
+      console.error("Admin worker error:", err);
+    });
+
+    console.log("Admin worker started");
+  }
+
+  startIOWorkers() {
+    const ioWorkerPath = join(__dirname, "io-worker.js");
 
     for (let i = 0; i < this.numWorkers; i++) {
-      const worker = new Worker(workerPath, { workerData: { threadId: i } });
+      const worker = new Worker(ioWorkerPath, { workerData: { threadId: i } });
 
       worker.on("message", (response) => {
-        this.handleWorkerResponse(response);
+        this.handleIOWorkerResponse(response);
       });
 
       worker.on("error", (err) => {
-        console.error(`Worker ${i} error:`, err);
+        console.error(`IO Worker ${i} error:`, err);
       });
 
-      this.workers.push(worker);
-      console.log(`Worker ${i} started`);
+      this.ioWorkers.push(worker);
+      console.log(`IO Worker ${i} started`);
     }
   }
 
   handleConnection(socket) {
     const connectionId = `${socket.remoteAddress}:${socket.remotePort}`;
-    console.log(`New connection bisect: ${connectionId}`);
+    console.log(`New connection: ${connectionId}`);
     let buffer = Buffer.alloc(0);
     this.connections.set(connectionId, socket);
 
     socket.on("data", (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
 
-      // Simple framing: Look for newline-delimited JSON
       let newlineIndex;
       while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, newlineIndex);
@@ -72,22 +97,11 @@ class KafkaBroker {
           const request = JSON.parse(line.toString());
           request.connectionId = connectionId;
           console.log(`[${connectionId}] Request:`, request);
-          if (API_TYPES.PRODUCE) {
-            const partition = request.partition || 0;
-            const offset = this.partitionOffsets.get(partition) || 0;
-            request.offset = offset;
-            this.partitionOffsets.set(partition, offset + 1);
-          }
-          this.requestQueue.push(request);
-          console.log(`Queue size: ${this.requestQueue.length}`);
 
-          const worker = this.workers[this.nextWorkerId];
-          worker.postMessage(request);
-          this.nextWorkerId = (this.nextWorkerId + 1) % this.numWorkers;
+          this.routeRequest(request, socket);
         } catch (err) {
           console.error(`[${connectionId}] Parse error:`, err.message);
           this.sendError(socket, err.message);
-          // this.stats.errors++;
         }
       }
     });
@@ -103,8 +117,133 @@ class KafkaBroker {
     });
   }
 
-  handleWorkerResponse(response) {
-    console.log("[Main] Worker response:", response);
+  routeRequest(request, socket) {
+    
+    switch (request.apiKey) {
+      // Admin read operations - serve from main thread cache (fast path)
+      case API_TYPES.LIST_TOPICS:
+        this.handleListTopics(request, socket);
+        break;
+
+      // case API_TYPES.DE:
+      //   this.handleDescribeTopic(request, socket);
+      //   break;
+
+      // Admin write operations - forward to admin worker
+      case ADMIN_COMMAND_TYPES.CREATE_TOPIC:
+      case ADMIN_COMMAND_TYPES.EDIT_PARTITIONS:
+        this.forwardToAdminWorker(request);
+        break;
+
+      // Produce/Consume operations - forward to IO workers
+      case API_TYPES.PRODUCE:
+      case API_TYPES.FETCH:
+        this.forwardToIOWorker(request, socket);
+        break;
+
+      default:
+        this.sendError(socket, `Unknown request type: ${type}`);
+    }
+  }
+
+  // Fast path: List topics from cache (no thread communication)
+  handleListTopics(request, socket) {
+    try {
+      const topics = this.metadataManager.listTopics();
+      this.sendResponse(socket, {
+        status: "success",
+        topics,
+      });
+    } catch (err) {
+      this.sendError(socket, err.message);
+    }
+  }
+
+  // Fast path: Describe topic from cache
+  handleDescribeTopic(request, socket) {
+    try {
+      const { topic } = request;
+      const metadata = this.metadataManager.getTopicMetadata(topic);
+      
+      if (!metadata) {
+        this.sendError(socket, `Topic ${topic} not found`);
+        return;
+      }
+
+      this.sendResponse(socket, {
+        status: "success",
+        topic,
+        metadata,
+      });
+    } catch (err) {
+      this.sendError(socket, err.message);
+    }
+  }
+
+  // Forward admin write operations to dedicated admin worker
+  forwardToAdminWorker(request) {
+    this.requestQueue.push(request);
+    this.adminWorker.postMessage(request);
+  }
+
+  // Forward produce/consume to IO workers with metadata validation
+  forwardToIOWorker(request, socket) {
+    // Pre-validate topic exists (fail fast)
+    if (request.topic && !this.metadataManager.checkTopicExists(request.topic)) {
+      this.sendError(socket, `Topic ${request.topic} does not exist`);
+      return;
+    }
+
+    // Get topic metadata and attach to request
+    if (request.topic) {
+      request.topicMetadata = this.metadataManager.getTopicMetadata(request.topic);
+    }
+
+    // Add offset tracking for produce requests
+    if (request.type === API_TYPES.PRODUCE) {
+      const partition = request.partition || 0;
+      const offset = this.partitionOffsets.get(partition) || 0;
+      request.offset = offset;
+      this.partitionOffsets.set(partition, offset + 1);
+    }
+
+    this.requestQueue.push(request);
+
+    // Round-robin to IO workers
+    const worker = this.ioWorkers[this.nextWorkerId];
+    worker.postMessage(request);
+    this.nextWorkerId = (this.nextWorkerId + 1) % this.numWorkers;
+  }
+
+  handleAdminWorkerResponse(response) {
+    console.log("[Main] Admin worker response:", response);
+
+    const socket = this.connections.get(response.connectionId);
+
+    if (socket) {
+      if (response.status === "error") {
+        this.sendError(socket, response.message);
+      } else {
+        // Update main thread cache with the new metadata
+        if (response.data && response.data.record) {
+          this.metadataManager.updateCache(response.data.record);
+        }
+
+        // Send success response to client
+        socket.write(JSON.stringify({
+          status: "success",
+          ...response.data
+        }) + "\n");
+      }
+    } else {
+      console.error("Socket not found for:", response.connectionId);
+    }
+
+    this.requestQueue.shift();
+  }
+
+  handleIOWorkerResponse(response) {
+    console.log("[Main] IO worker response:", response);
 
     const socket = this.connections.get(response.connectionId);
 
@@ -112,8 +251,7 @@ class KafkaBroker {
       if (response.status === "error") {
         this.sendError(socket, response.message || "Unknown error");
       } else {
-        // Success response
-        socket.write(JSON.stringify(response.data || {"status": "ok"}) + "\n");
+        socket.write(JSON.stringify(response.data || { status: "ok" }) + "\n");
       }
     } else {
       console.error("Socket not found for:", response.connectionId);
